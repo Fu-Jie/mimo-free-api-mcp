@@ -1,0 +1,13 @@
+services:
+  mimo-free-api-mcp:
+    container_name: mimo-free-api-mcp
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "8001:8001"
+    environment:
+      - TZ=Asia/Shanghai
+      - SERVER_ENV=prod
+      - NODE_ENV=production
