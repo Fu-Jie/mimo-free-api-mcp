@@ -141,6 +141,19 @@ export async function getCredentials(req?: any) {
     }
 
     // 2. 尝试从环境变量兜底 (Static Deployment)
+    const envTokenVar = process.env.token;
+    if (envTokenVar && (envTokenVar.includes(".") || envTokenVar.includes("/"))) {
+        const separator = envTokenVar.includes(".") ? "." : "/";
+        const parts = envTokenVar.split(separator);
+        if (parts.length >= 2) {
+            const ph = parts[0];
+            const userId = parts.length === 3 ? parts[1] : (process.env.xiaomichatbot_userId || "");
+            const serviceToken = parts[parts.length - 1];
+            const cookie = `userId=${userId}; xiaomichatbot_ph=${ph}; serviceToken=${serviceToken}`;
+            return { xiaomichatbot_ph: ph, userId: userId, serviceToken: serviceToken, cookie: cookie };
+        }
+    }
+
     const envPh = process.env.xiaomichatbot_ph;
     const envUserId = process.env.xiaomichatbot_userId;
     const envToken = process.env.xiaomichatbot_serviceToken;
@@ -240,6 +253,8 @@ async function uploadMediaToMimo(base64Data: string, cookie: string, xiaomichatb
             if (low.includes("flash")) {
                 return low.endsWith("-studio") ? low : `${low}-studio`;
             }
+            if (low === "mimo-v2-omni") return "mimo-v2.5";
+            if (low === "mimo-v2-pro") return "mimo-v2.5-pro";
             return low;
         };
         const readyModelForParse = getReadyModelForParse(model);
@@ -368,10 +383,10 @@ export function createCompletionStream(model: string, messages: any[], convId?: 
 
     // 🌟 2. 智商升配与模型锁定（识图场景锁定 Omni 以提高解析成功率）
     if (base64Medias.length > 0) {
-        readyModel = "mimo-v2-omni"; 
+        readyModel = "mimo-v2.5"; 
         logger.info(`[AutoUpgrade] Vision detected, switching to ${readyModel}`);
     } else if (req?.body?.tools) {
-        readyModel = "mimo-v2-omni";
+        readyModel = "mimo-v2.5";
         logger.info(`[AutoUpgrade] Tools detected, switching to ${readyModel}`);
     }
 
@@ -553,6 +568,8 @@ Current Task: `;
                 if (low.includes("flash")) {
                     return low.endsWith("-studio") ? low : `${low}-studio`;
                 }
+                if (low === "mimo-v2-omni") return "mimo-v2.5";
+                if (low === "mimo-v2-pro") return "mimo-v2.5-pro";
                 return low;
             };
 
@@ -570,7 +587,10 @@ Current Task: `;
                 scene: 'STATION',
                 isLocal: false,
                 modelConfig: {
-                    enableThinking: false, 
+                    enableThinking: (readyModel.includes("v2.5") || readyModel.includes("pro")), 
+                    thinking: {
+                        type: (readyModel.includes("v2.5") || readyModel.includes("pro")) ? "enabled" : "disabled"
+                    },
                     webSearchStatus: (req?.body?.web_search === true) ? "enabled" : "disabled",
                     model: readyModelWithStudio,
                     temperature: temperature,
@@ -589,6 +609,7 @@ Current Task: `;
                     url: m.url 
                 }))
             };
+            logger.info(`[Mimo Payload JSON] ${JSON.stringify(payload)}`);
             logger.info(`[Mimo Payload] Model: ${readyModelWithStudio} | Medias: ${multiMedias.length} | Hash: ${payload.multiMedias[0]?.url}`);
             logger.info(`[Mimo Payload] Model: ${readyModel} | Medias: ${multiMedias.length} | HasNew: ${isAnyNewMedia}`);
 
@@ -1106,10 +1127,11 @@ export async function performSearch(query: string, req?: any) {
         scene: 'STATION',
         atMsgId: '',
         modelConfig: {
-            enableThinking: false,
+            enableThinking: true,
+            thinking: { type: "enabled" },
             enableReference: true, 
             webSearchStatus: "enabled",
-            model: "mimo-v2-pro", // 🌟 搜索专供模型
+            model: "mimo-v2.5-pro", 
         },
         multiMedias: []
     };
@@ -1271,7 +1293,7 @@ export async function performVision(query: string, medias: any[], req?: any) {
             if (!mediaCache.has(md5)) isAnyNewMedia = true;
             
             const dataUrl = `data:${mimeType};base64,${base64}`;
-            const mediaObj = await uploadMediaToMimo(dataUrl, cookie, xiaomichatbot_ph, "mimo-v2-omni");
+            const mediaObj = await uploadMediaToMimo(dataUrl, cookie, xiaomichatbot_ph, req?.body?.model || "mimo-v2.5");
             
             if (mediaObj) {
                 let mediaType = "image";
@@ -1311,9 +1333,10 @@ export async function performVision(query: string, medias: any[], req?: any) {
         scene: 'STATION',
         atMsgId: '',
         modelConfig: {
-            enableThinking: false,
+            enableThinking: true,
+            thinking: { type: "enabled" },
             webSearchStatus: "disabled",
-            model: "mimo-v2-omni", 
+            model: req?.body?.model || "mimo-v2.5", 
         },
         multiMedias: multiMedias
     };

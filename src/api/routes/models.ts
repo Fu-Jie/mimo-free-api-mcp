@@ -18,12 +18,6 @@ export default {
                         "capabilities": capabilities
                     },
                     {
-                        "id": "mimo-v2-flash-thinking",
-                        "object": "model",
-                        "owned_by": "xiaomi",
-                        "capabilities": capabilities
-                    },
-                    {
                         "id": "mimo-v2-omni",
                         "object": "model",
                         "owned_by": "xiaomi",
@@ -31,6 +25,18 @@ export default {
                     },
                     {
                         "id": "mimo-v2-pro",
+                        "object": "model",
+                        "owned_by": "xiaomi",
+                        "capabilities": capabilities
+                    },
+                    {
+                        "id": "mimo-v2.5",
+                        "object": "model",
+                        "owned_by": "xiaomi",
+                        "capabilities": capabilities
+                    },
+                    {
+                        "id": "mimo-v2.5-pro",
                         "object": "model",
                         "owned_by": "xiaomi",
                         "capabilities": capabilities

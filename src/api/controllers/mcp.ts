@@ -43,7 +43,7 @@ export class MCPServerManager {
      */
     private static createServerWithRef(sessionRef: { id: string }, fallbackRequest: Request): Server {
         const server = new Server(
-            { name: "mimo-free-api-mcp", version: "1.1.0" },
+            { name: "mimo-free-api-mcp", version: "1.2.0" },
             { capabilities: { tools: {} } }
         );
 
