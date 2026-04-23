@@ -1,5 +1,8 @@
 # MiMo Free API MCP🚀 (V2.5 Series)
 
+[English](./README_EN.md) | 简体中文
+
+
 > 基于小米大模型（MiMo）官方网站（[aistudio.xiaomimimo.com](https://aistudio.xiaomimimo.com)）逆向构建的高级 OpenAI 兼容网关 + 原生 MCP 插件集成。现已全量适配 **MiMo V2.5 全模态** 系列，支持 **Thinking (思维链) 协议** 与 **Omni (全模态) 交互**。
 
 ---
