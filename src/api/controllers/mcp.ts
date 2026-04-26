@@ -63,12 +63,12 @@ export class MCPServerManager {
                 },
                 {
                     name: "vision",
-                    description: "Analyze images, videos, or documents using Mimo AI. Can handle local file paths or Base64 data.",
+                    description: "Multi-modal analysis for images, videos, and audio. Supports URLs, Base64 data URIs, or simple Filenames (which are automatically retrieved from the fixed /app/media storage).",
                     inputSchema: {
                         type: "object",
                         properties: {
-                            query: { type: "string", description: "The question or instruction about the media" },
-                            image: { type: "string", description: "Base64 data or URL representing the media" },
+                            query: { type: "string", description: "The question or instruction about the media content" },
+                            image: { type: "string", description: "Media source: Can be a URL, Base64 URI, or just a Filename (e.g., 'video.mp4') from the local storage." },
                         },
                         required: ["query", "image"]
                     }
@@ -131,7 +131,8 @@ export class MCPServerManager {
      * Follows the 2025-03-26 Streamable HTTP specification.
      */
     static async handle(ctx: any, request: Request) {
-        const sessionId = ctx.headers["mcp-session-id"] as string | undefined;
+        // Support session ID from both headers (standard) and query (SSE fallback)
+        const sessionId = (ctx.headers["mcp-session-id"] || ctx.query.sessionId) as string | undefined;
         const body = request.body;
 
         // --- POST: JSON-RPC messages ---
@@ -192,15 +193,22 @@ export class MCPServerManager {
         // --- GET: SSE stream for server-initiated notifications ---
         if (ctx.method === "GET") {
             if (sessionId && this.transports[sessionId]) {
-                logger.info(`[MCP] SSE stream requested for session: ${sessionId}`);
+                logger.info(`[MCP] SSE stream established for session: ${sessionId}`);
                 await this.transports[sessionId].transport.handleRequest(ctx.req, ctx.res, undefined);
                 ctx.respond = false;
                 return;
             }
 
-            logger.warn("[MCP] GET without valid session");
-            ctx.status = 400;
-            ctx.body = { error: "No valid session for SSE" };
+            if (!sessionId) {
+                // Health check or initial probe
+                ctx.status = 200;
+                ctx.body = { status: "ok", service: "mimo-mcp", message: "Send a POST with initialize request to start a session." };
+                return;
+            }
+
+            logger.info(`[MCP] GET rejected: Session ${sessionId} not found or expired.`);
+            ctx.status = 410; // Gone
+            ctx.body = { error: "Session expired", code: "SESSION_EXPIRED" };
             return;
         }
 

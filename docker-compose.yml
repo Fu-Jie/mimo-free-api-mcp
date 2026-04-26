@@ -11,3 +11,8 @@ services:
       - TZ=Asia/Shanghai
       - SERVER_ENV=prod
       - NODE_ENV=production
+      - token=${token:-}
+    # ✨ Fixed Media Storage
+    # To enable local file analysis, add a volumes section:
+    # volumes:
+    #   - /path/to/your/media:/app/media:ro

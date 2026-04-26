@@ -37,6 +37,8 @@ db.exec(`
     )
 `);
 
+const MEDIA_BASE_DIR = "/app/media";
+
 const getSystemConfig = (key: string, defaultValue: any) => {
     const row = db.prepare("SELECT config_value FROM system_config WHERE config_key = ?").get(key) as any;
     if (row) {
@@ -325,17 +327,41 @@ function messagesPrepare(messages: any[]): { query: string, base64Medias: { base
                 if (item.type === "text") { text += item.text; }
                 else if ((item.type === "image_url" || item.type === "video_url" || item.type === "audio_url" || item.type === "input_file") && item[item.type]?.url) {
                     const url = item[item.type].url;
-                    if (url.startsWith("data:")) {
-                        const base64 = url.split(",")[1];
-                        if (base64 && !seenBase64.has(base64)) {
-                            const mime = url.split(";")[0].split(":")[1];
-                            let type = 'image';
-                            if (mime.startsWith('video')) type = 'video';
-                            else if (mime.startsWith('audio')) type = 'audio';
-                            base64Medias.push({ base64, type, mimeType: mime });
-                            seenBase64.add(base64);
+                        if (url.startsWith("data:")) {
+                            const base64 = url.split(",")[1];
+                            if (base64 && !seenBase64.has(base64)) {
+                                const mime = url.split(";")[0].split(":")[1];
+                                let type = 'image';
+                                if (mime.startsWith('video')) type = 'video';
+                                else if (mime.startsWith('audio')) type = 'audio';
+                                base64Medias.push({ base64, type, mimeType: mime });
+                                seenBase64.add(base64);
+                            }
+                        } else if (url.startsWith("http")) {
+                            // HTTP handled later
+                        } else {
+                            // ✨ Fixed Directory Logic for API Mode
+                            const fileName = path.basename(url);
+                            const targetPath = path.join(MEDIA_BASE_DIR, fileName);
+                            
+                            if (fs.pathExistsSync(targetPath) && fs.lstatSync(targetPath).isFile()) {
+                                try {
+                                    const buffer = fs.readFileSync(targetPath);
+                                    const base64 = buffer.toString('base64');
+                                    if (base64 && !seenBase64.has(base64)) {
+                                        let type = 'image';
+                                        if (fileName.endsWith('.mp4') || fileName.endsWith('.mov')) type = 'video';
+                                        else if (fileName.endsWith('.mp3') || fileName.endsWith('.wav')) type = 'audio';
+                                        
+                                        base64Medias.push({ base64, type, mimeType: "application/octet-stream" });
+                                        seenBase64.add(base64);
+                                        logger.info(`[Media] Read from fixed storage: ${targetPath}`);
+                                    }
+                                } catch (e) {
+                                    logger.error(`[Media Error] ${targetPath}: ${e.message}`);
+                                }
+                            }
                         }
-                    }
                 }
             });
         } else {
@@ -1265,7 +1291,11 @@ export async function performVision(query: string, medias: any[], req?: any) {
     const multiMedias: any[] = [];
     let isAnyNewMedia = false; 
 
-    for (const mediaSource of medias) {
+    for (const item of medias) {
+        // Support both object {image: "..."} and string "..."
+        const mediaSource = typeof item === 'string' ? item : item.image;
+        if (!mediaSource) continue;
+
         let base64 = "";
         let mimeType = "image/jpeg";
         
@@ -1283,7 +1313,33 @@ export async function performVision(query: string, medias: any[], req?: any) {
                     continue;
                 }
             } else {
-                base64 = mediaSource; 
+                // ✨ Fixed Directory Logic: Use MEDIA_BASE_DIR for local files
+                const fileName = path.basename(mediaSource);
+                const targetPath = path.join(MEDIA_BASE_DIR, fileName);
+                
+                if (fs.pathExistsSync(targetPath) && fs.lstatSync(targetPath).isFile()) {
+                    try {
+                        const buffer = await fs.readFile(targetPath);
+                        base64 = buffer.toString('base64');
+                        
+                        // 🌟 Dynamic MIME Detection
+                        const ext = path.extname(fileName).toLowerCase();
+                        if (['.mp4', '.mov', '.webm'].includes(ext)) mimeType = "video/mp4";
+                        else if (['.png'].includes(ext)) mimeType = "image/png";
+                        else if (['.gif'].includes(ext)) mimeType = "image/gif";
+                        else if (['.mp3', '.wav', '.m4a'].includes(ext)) mimeType = "audio/mpeg";
+                        else mimeType = "image/jpeg";
+
+                        logger.info(`[Vision Storage] Read: ${fileName} | Type: ${mimeType} | Size: ${buffer.length}`);
+                    } catch (e) {
+                        logger.error(`[Vision Local File Error] ${targetPath}: ${e.message}`);
+                        continue;
+                    }
+                } else {
+                    const errMsg = `Media file not found in storage: ${fileName}. Please ensure the file is placed in the mounted media directory.`;
+                    logger.error(`[Vision Path Error] ${errMsg}`);
+                    throw new Error(errMsg);
+                }
             }
         }
 
@@ -1328,9 +1384,11 @@ export async function performVision(query: string, medias: any[], req?: any) {
         query: query,
         messages: [],
         parentId: "0",
-        save: false,
+        save: true,
+        isEditedQuery: false,
         source: 'STATION',
         scene: 'STATION',
+        isLocal: false,
         atMsgId: '',
         modelConfig: {
             enableThinking: true,
@@ -1338,16 +1396,27 @@ export async function performVision(query: string, medias: any[], req?: any) {
             webSearchStatus: "disabled",
             model: req?.body?.model || "mimo-v2.5", 
         },
-        multiMedias: multiMedias
+        multiMedias: multiMedias.map((m: any) => ({
+            mediaType: m.mediaType,
+            fileUrl: m.fileUrl,
+            compressedVideoUrl: "",
+            audioTrackUrl: "",
+            name: m.name,
+            size: m.size,
+            status: "completed",
+            objectName: m.objectName,
+            tokenUsage: m.tokenUsage, 
+            url: m.url 
+        }))
     };
 
-    const headers: any = {
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-        "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://aistudio.xiaomimimo.com/",
-        "Origin": "https://aistudio.xiaomimimo.com"
+    const headers: any = { 
+        "Content-Type": "application/json", 
+        "Accept": "text/event-stream, text/plain, */*",
+        "Cookie": cookie, 
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0", 
+        "Referer": "https://aistudio.xiaomimimo.com/", 
+        "Origin": "https://aistudio.xiaomimimo.com" 
     };
 
     return new Promise((resolve, reject) => {

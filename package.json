@@ -1,6 +1,6 @@
 {
   "name": "mimo-free-api-mcp",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "MiMo Free API MCP: Unified OpenAI Gateway & Model Context Protocol Server",
   "main": "dist/index.mjs",
   "type": "module",

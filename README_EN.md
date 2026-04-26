@@ -30,6 +30,9 @@ English | [简体中文](./README.md)
 > [!TIP]
 > **Force Enable Thinking**: You can force activate the reasoning chain for any model by adding the `-thinking` suffix to the Model ID (e.g., `mimo-v2-flash-thinking`).
 
+> [!WARNING]
+> **Tool Calling Limitation**: Native Function Calling is currently extremely unstable and **cannot be reliably used in Agents (e.g., AutoGPT, LangChain Agents)**. It is recommended for use only in dialogue, visual analysis, or via the MCP plugin in supported clients (e.g., Claude/Cursor).
+
 ---
 
 ## 🔑 Credential Configuration
@@ -37,17 +40,40 @@ English | [简体中文](./README.md)
 The project supports passing credentials via environment variables or API headers.
 
 ### Method A: One-click .env Deployment (Recommended)
-Create a `.env` file in the root directory and fill in the three-part Token captured from the official website:
+Create a `.env` file in the root directory (refer to `.env.example`) and fill in the Token captured from the official website:
 ```env
-# Format: ph.uid.token
+# Format: ph.uid.token or long encrypted string
 token=xxxxxxxx.yyyyyyyy.zzzzzzzz
 ```
 
 ### Method B: OpenAI Header Transmission
 Use the Bearer Token directly during API calls:
 ```bash
-Authorization: Bearer xxxxxxxx.yyyyyyyy.zzzzzzzz
+Authorization: Bearer YOUR_MIMO_TOKEN
 ```
+
+---
+
+## 📂 Local File Support (Docker Mode)
+
+When running in Docker, the service cannot access host files by default due to container isolation.
+
+### Core Workflow:
+1. **Multi-Mode Support**: This project supports **URLs**, **Base64 Data**, and **Local Filenames**.
+2. **Mount & Map (Local)**: To use local files, place them in a host directory and map it to `/app/media` in your `docker-compose.yml`:
+   ```yaml
+   volumes:
+     - /your/host/path:/app/media:ro
+   ```
+3. **Simple Access**: Once mounted, just tell the AI the filename (e.g., "Analyze `test.mp4`"). The system will automatically look in `/app/media`.
+
+### 💡 Usage Tips & Prompting Guide
+- **Filename (Recommended)**: "Analyze this local video: `demo.mp4`"
+- **URL Address**: "Check this online image: `https://example.com/cat.jpg`"
+- **Base64**: Simply paste the Base64 Data URI to the AI.
+- **Comparison**: "Compare `local_image.png` with this web image `https://.../2.jpg`"
+
+> **Note**: Ensure the AI has access to the `vision` tool. This project informs the AI in the tool schema about these multiple sources.
 
 ---
 
@@ -74,7 +100,7 @@ Please add the following configuration to `claude_desktop_config.json`:
 
 ### Provided Tools
 - **`search(query)`**: AI automatically calls MiMo's web search.
-- **`vision(query, image)`**: AI analyzes images, videos, or local resources (automatically mapped to the V2.5 engine).
+- **`vision(query, image)`**: AI analyzes images, videos, audio, or local resources (supports local absolute paths, Base64, or URLs).
 
 ---
 
