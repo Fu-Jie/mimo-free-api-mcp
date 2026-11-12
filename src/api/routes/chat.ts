@@ -19,7 +19,7 @@ export default {
 
             let { model, conversation_id, chat_id, messages, stream } = request.body;
             const convId = conversation_id || chat_id;
-            model = (model || "mimo-v2.5").toLowerCase();
+            model = (model || "mimo-v2.6-flash").toLowerCase();
 
             if (stream) {
                 const streamResponse = await mimo.createCompletionStream(model, messages, convId, request);
