@@ -11,14 +11,17 @@ export default {
         '/vision': async (request: Request) => {
             request.validate('body.query', v => typeof v === 'string' && v.length > 0);
             
-            const { query, image, images } = request.body;
+            const { query, image, images, model, enable_thinking } = request.body;
             const imageList = Array.isArray(images) ? images : (image ? [image] : []);
             
             if (imageList.length === 0) {
                 throw new Error("No images provided for recognition");
             }
 
-            const result = await mimo.performVision(query, imageList, request);
+            const result = await mimo.performVision(query, imageList, request, {
+                model: typeof model === 'string' ? model : undefined,
+                enableThinking: typeof enable_thinking === 'boolean' ? enable_thinking : undefined,
+            });
             
             return new Response(result, {
                 type: "application/json"

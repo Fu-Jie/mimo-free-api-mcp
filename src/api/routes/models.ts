@@ -12,6 +12,30 @@ export default {
             return {
                 "data": [
                     {
+                        "id": "mimo-v2.6-pro",
+                        "object": "model",
+                        "owned_by": "xiaomi",
+                        "capabilities": capabilities
+                    },
+                    {
+                        "id": "mimo-v2.6-flash",
+                        "object": "model",
+                        "owned_by": "xiaomi",
+                        "capabilities": capabilities
+                    },
+                    {
+                        "id": "mimo-v2.5",
+                        "object": "model",
+                        "owned_by": "xiaomi",
+                        "capabilities": capabilities
+                    },
+                    {
+                        "id": "mimo-v2.5-pro",
+                        "object": "model",
+                        "owned_by": "xiaomi",
+                        "capabilities": capabilities
+                    },
+                    {
                         "id": "mimo-v2-flash",
                         "object": "model",
                         "owned_by": "xiaomi",
@@ -25,18 +49,6 @@ export default {
                     },
                     {
                         "id": "mimo-v2-pro",
-                        "object": "model",
-                        "owned_by": "xiaomi",
-                        "capabilities": capabilities
-                    },
-                    {
-                        "id": "mimo-v2.5",
-                        "object": "model",
-                        "owned_by": "xiaomi",
-                        "capabilities": capabilities
-                    },
-                    {
-                        "id": "mimo-v2.5-pro",
                         "object": "model",
                         "owned_by": "xiaomi",
                         "capabilities": capabilities
