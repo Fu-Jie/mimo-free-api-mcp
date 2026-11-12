@@ -1,33 +1,33 @@
 # ---------------------------------------------------------
 # Step 1: Build source
 # ---------------------------------------------------------
-FROM node:lts-alpine AS build
+FROM node:24-alpine AS build
 
 WORKDIR /app
 
 # Install all dependencies for building
-COPY package.json yarn.lock ./
-RUN yarn install --registry https://registry.npmmirror.com/
+COPY package.json package-lock.json ./
+RUN npm ci --registry https://registry.npmmirror.com/
 
 # Copy source and build
 COPY . .
-RUN yarn build
+RUN npm run build
 
 # ---------------------------------------------------------
 # Step 2: Prepare production node_modules
 # ---------------------------------------------------------
-FROM node:lts-alpine AS prod-deps
+FROM node:24-alpine AS prod-deps
 
 WORKDIR /app
 
 # Only install mandatory production dependencies
-COPY package.json yarn.lock ./
-RUN yarn install --production --registry https://registry.npmmirror.com/ --prefer-offline
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --registry https://registry.npmmirror.com/
 
 # ---------------------------------------------------------
 # Step 3: Minimal Runtime image
 # ---------------------------------------------------------
-FROM node:lts-alpine
+FROM node:24-alpine
 
 WORKDIR /app
 ENV NODE_ENV=production
