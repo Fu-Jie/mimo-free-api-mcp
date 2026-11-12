@@ -198,16 +198,22 @@ function formatOpenAIChunk(content: string | null, model: string, finishReason: 
 }
 
 /**
- * 🌟 平台模型映射（2026-10 平台升级后）：
- * - v2-flash 系列已在 react 协议中下线（返回"模型名称错误"），映射到现役 flash 档位 mimo-v2.6-flash
- * - 其余名称原样透传（v2.5 / v2.5-pro / v2.6-pro / v2.6-flash 均为裸 ID）
+ * 🌟 平台模型映射（全部升级至 2.6 系列默认）：
+ * - v2-flash / v2-omni -> mimo-v2.6-flash（极速全模态，兼容图文/PDF/视频/工具调用）
+ * - v2-pro -> mimo-v2.6-pro（旗舰推理）
+ * - 其余名称原样透传（显式指定 mimo-v2.5 / mimo-v2.5-pro 仍兼容）
  */
 function mapStationModel(original: string): string {
     const low = original.toLowerCase();
-    if (low.includes("v2-flash")) return "mimo-v2.6-flash";
-    if (low === "mimo-v2-omni") return "mimo-v2.5";
-    if (low === "mimo-v2-pro") return "mimo-v2.5-pro";
+    if (low.includes("v2-flash") || low === "mimo-v2-omni") return "mimo-v2.6-flash";
+    if (low === "mimo-v2-pro") return "mimo-v2.6-pro";
     return low;
+}
+
+function sleep(ms: number): Promise<void> {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, ms);
+    return promise;
 }
 
 // 三步走：上传图片到小米文件服务器
@@ -217,10 +223,13 @@ async function uploadMediaToMimo(base64Data: string, cookie: string, xiaomichatb
     const buffer = Buffer.from(pureBase64, "base64");
     const md5 = crypto.createHash("md5").update(buffer).digest("hex");
 
-    // 🌟 核心缓存：如果该图片已经上传并解析过，直接复用 ID，实现持久会话
-    if (mediaCache.has(md5)) {
-        logger.info(`[Media Cache Hit] Skipping upload for MD5: ${md5}`);
-        return mediaCache.get(md5);
+    const readyModelForParse = mapStationModel(model);
+    const cacheKey = `${readyModelForParse}:${md5}`;
+
+    // 🌟 核心缓存：按模型+MD5 隔离复用 ID，避免跨模型复用错误解析结果
+    if (mediaCache.has(cacheKey)) {
+        logger.info(`[Media Cache Hit] Skipping upload for ${cacheKey}`);
+        return mediaCache.get(cacheKey);
     }
 
     const mimeResult = await fileTypeFromBuffer(buffer);
@@ -263,7 +272,6 @@ async function uploadMediaToMimo(base64Data: string, cookie: string, xiaomichatb
         logger.info(`[FDS PUT Success] ${objectName}`);
 
         // 3. 注册挂载并换取核心 ID (增加重试机制)
-        const readyModelForParse = mapStationModel(model);
         const parseUrl = `https://aistudio.xiaomimimo.com/open-apis/resource/parse?fileUrl=${encodeURIComponent(resourceUrl)}&objectName=${encodeURIComponent(objectName)}&model=${readyModelForParse}&xiaomichatbot_ph=${encodeURIComponent(xiaomichatbot_ph)}`;
         logger.info(`[Multimedia Parse Request] URL: ${parseUrl}`);
         
@@ -273,19 +281,20 @@ async function uploadMediaToMimo(base64Data: string, cookie: string, xiaomichatb
 
         while (retryCount < maxRetries) {
             try {
-                parseRes = await axios.post(parseUrl, {}, { headers: { "Cookie": cookie, "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Referer": "https://aistudio.xiaomimimo.com/", "Origin": "https://aistudio.xiaomimimo.com" } });
+                parseRes = await axios.post(parseUrl, {}, {
+                    timeout: 30000,
+                    headers: { "Cookie": cookie, "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Referer": "https://aistudio.xiaomimimo.com/", "Origin": "https://aistudio.xiaomimimo.com" }
+                });
                 if (parseRes.data && parseRes.data.code === 0 && parseRes.data.data && parseRes.data.data.id) {
-                    // 🌟 沉淀解析：给小米视觉引擎一点内部索引时间
-                    logger.info(`[Ingestion Success] Resource ID: ${parseRes.data.data.id}. Waiting 3s for indexing...`);
-                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    logger.info(`[Ingestion Success] Resource ID: ${parseRes.data.data.id}`);
                     break;
                 }
-            } catch (e) {
-                logger.warn(`[Parse Attempt ${retryCount}] Failed: ${e.message}`);
+            } catch (e: unknown) {
+                logger.warn(`[Parse Attempt ${retryCount}] Failed: ${getErrorMessage(e)}`);
             }
             retryCount++;
             if (retryCount < maxRetries) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                await sleep(2000);
             }
         }
 
@@ -295,31 +304,45 @@ async function uploadMediaToMimo(base64Data: string, cookie: string, xiaomichatb
             let mediaType = "image";
             if (isVideo) mediaType = "video";
             else if (isAudio) mediaType = "audio";
-            else if (mimeType.includes("pdf")) mediaType = "pdf";
+            else if (mimeType.includes("pdf")) mediaType = "file";
+
+            // 视频/音频/PDF 需要短暂后端索引等待；图片通过 audit/submit 状态确认，无需额外硬等待
+            if (isVideo || isAudio || mediaType === "file") {
+                await sleep(3000);
+            }
 
             // 🌟 新协议必需：图片必须提交内容审核 (audit/submit)，否则聊天时被 sensitive_query 静默拦截
             if (mediaType === "image") {
-                try {
-                    const auditRes = await axios.post(
-                        `https://aistudio.xiaomimimo.com/open-apis/audit/submit?xiaomichatbot_ph=${encodeURIComponent(xiaomichatbot_ph)}`,
-                        { businessCode: "chat_input_image", fileUrl: resourceUrl, fileName },
-                        { headers }
-                    );
-                    const auditResult = auditRes?.data?.data?.result;
-                    if (auditResult === "PASS") {
-                        logger.info(`[Image Audit] PASS: ${fileName}`);
-                    } else {
-                        logger.warn(`[Image Audit] Non-PASS result "${auditResult}" for ${fileName} — backend may reject this image`);
+                for (let auditAttempt = 1; auditAttempt <= 3; auditAttempt++) {
+                    try {
+                        const auditRes = await axios.post(
+                            `https://aistudio.xiaomimimo.com/open-apis/audit/submit?xiaomichatbot_ph=${encodeURIComponent(xiaomichatbot_ph)}`,
+                            { businessCode: "chat_input_image", fileUrl: resourceUrl, fileName },
+                            { headers, timeout: 15000 }
+                        );
+                        const auditResult = auditRes?.data?.data?.result;
+                        if (auditResult === "PASS") {
+                            logger.info(`[Image Audit] PASS: ${fileName}`);
+                            break;
+                        }
+                        if (auditResult === "REJECT" || auditResult === "BLOCK") {
+                            logger.warn(`[Image Audit] Blocked "${auditResult}" for ${fileName}`);
+                            break;
+                        }
+                        logger.warn(`[Image Audit] Attempt ${auditAttempt} got "${auditResult}" for ${fileName}`);
+                    } catch (e: unknown) {
+                        logger.warn(`[Image Audit] Attempt ${auditAttempt} failed: ${getErrorMessage(e)}`);
                     }
-                } catch (e: any) {
-                    logger.warn(`[Image Audit] Submit failed (proceeding anyway): ${e.message}`);
+                    if (auditAttempt < 3) {
+                        await sleep(1000);
+                    }
                 }
             }
 
             const result = {
                 mediaType: mediaType,
                 fileUrl: resourceUrl,
-                compressedVideoUrl: "",
+                compressedVideoUrl: isVideo ? resourceUrl : "",
                 audioTrackUrl: isAudio ? resourceUrl : "",
                 name: fileName,
                 size: buffer.length,
@@ -328,7 +351,7 @@ async function uploadMediaToMimo(base64Data: string, cookie: string, xiaomichatb
                 tokenUsage: parseRes.data.data.tokenUsage || 106,
                 url: parseRes.data.data.id // 🌟 核心绑定：/resource/parse 返回 data.id
             };
-            mediaCache.set(md5, result);
+            mediaCache.set(cacheKey, result);
             return result;
         } else {
             throw new Error(`Parse failed after ${retryCount} retries: ${JSON.stringify(parseRes?.data || 'No Response')}`);
@@ -357,6 +380,7 @@ function messagesPrepare(messages: any[]): { query: string, base64Medias: { base
                                 let type = 'image';
                                 if (mime.startsWith('video')) type = 'video';
                                 else if (mime.startsWith('audio')) type = 'audio';
+                                else if (mime.includes('pdf')) type = 'file';
                                 base64Medias.push({ base64, type, mimeType: mime });
                                 seenBase64.add(base64);
                             }
@@ -373,8 +397,10 @@ function messagesPrepare(messages: any[]): { query: string, base64Medias: { base
                                     const base64 = buffer.toString('base64');
                                     if (base64 && !seenBase64.has(base64)) {
                                         let type = 'image';
-                                        if (fileName.endsWith('.mp4') || fileName.endsWith('.mov')) type = 'video';
-                                        else if (fileName.endsWith('.mp3') || fileName.endsWith('.wav')) type = 'audio';
+                                        const lowName = fileName.toLowerCase();
+                                        if (lowName.endsWith('.mp4') || lowName.endsWith('.mov') || lowName.endsWith('.webm')) type = 'video';
+                                        else if (lowName.endsWith('.mp3') || lowName.endsWith('.wav') || lowName.endsWith('.m4a')) type = 'audio';
+                                        else if (lowName.endsWith('.pdf')) type = 'file';
                                         
                                         base64Medias.push({ base64, type, mimeType: "application/octet-stream" });
                                         seenBase64.add(base64);
@@ -430,13 +456,17 @@ export function createCompletionStream(model: string, messages: any[], convId?: 
     let forceThinking = false;
     let lastMsgId = "0";
 
-    // 🌟 2. 智商升配与模型锁定（识图场景锁定 Omni 以提高解析成功率；显式请求 V2.6 时保持用户选择）
-    const prefersV26 = model.toLowerCase().includes("v2.6");
+    // 🌟 2. 智商升配与模型路由（纯图片默认走 2.6-pro 兼顾速度与细粒度推理；视频/音频/PDF/工具默认走 2.6-flash；显式传 v2.6-* 尊重用户选择）
+    const explicitModel = typeof req?.body?.model === "string" && req.body.model.trim().length > 0;
+    const prefersV26 = explicitModel && model.toLowerCase().includes("v2.6");
+    const isImageOnly = base64Medias.length > 0 && base64Medias.every((m) => m.type === "image");
     if (base64Medias.length > 0) {
-        if (!prefersV26) readyModel = "mimo-v2.5";
-        logger.info(`[AutoUpgrade] Vision detected, using ${readyModel}`);
+        if (!prefersV26) {
+            readyModel = (isImageOnly && !req?.body?.tools) ? "mimo-v2.6-pro" : "mimo-v2.6-flash";
+        }
+        logger.info(`[AutoUpgrade] Vision detected (${isImageOnly ? "image" : "non-image"}), using ${readyModel}`);
     } else if (req?.body?.tools) {
-        if (!prefersV26) readyModel = "mimo-v2.5";
+        if (!prefersV26) readyModel = "mimo-v2.6-flash";
         logger.info(`[AutoUpgrade] Tools detected, using ${readyModel}`);
     }
 
@@ -627,11 +657,11 @@ Current Task: `;
                     temperature: temperature,
                     topP: top_p
                 },
-                multiMedias: multiMedias.map((m: any) => ({
+                multiMedias: multiMedias.map((m: { mediaType: string; fileUrl: string; compressedVideoUrl?: string; audioTrackUrl?: string; name: string; size: number; objectName: string; tokenUsage: number; url: string }) => ({
                     mediaType: m.mediaType,
                     fileUrl: m.fileUrl,
-                    compressedVideoUrl: "",
-                    audioTrackUrl: "",
+                    compressedVideoUrl: m.compressedVideoUrl || "",
+                    audioTrackUrl: m.audioTrackUrl || "",
                     name: m.name,
                     size: m.size,
                     status: "completed",
@@ -643,16 +673,6 @@ Current Task: `;
             logger.info(`[Mimo Payload JSON] ${JSON.stringify(payload)}`);
             logger.info(`[Mimo Payload] Model: ${readyModelWithStudio} | Medias: ${multiMedias.length} | Hash: ${payload.multiMedias[0]?.url}`);
             logger.info(`[Mimo Payload] Model: ${readyModel} | Medias: ${multiMedias.length} | HasNew: ${isAnyNewMedia}`);
-
-            // 3. 异步图片预热：仅当有新图时才由于异步特征等待 3 秒；历史图（缓存命中所必解析过）直接秒开
-            if (multiMedias.length > 0) {
-                if (isAnyNewMedia) {
-                    logger.info(`[Vision] New media detected. Waiting 3s for async processing...`);
-                    await new Promise(resolve => setTimeout(resolve, 3000));
-                } else {
-                    logger.info(`[Vision] All media hit cache. Skipping delay (Lightning Fast mode ⚡)`);
-                }
-            }
             
             const encodedPh = encodeURIComponent(xiaomichatbot_ph);
             // 🌟 平台升级 (2026-10)：官方网页客户端已切换至 react/chat 端点，旧 bot/chat 对所有请求返回「平台升级」提示
@@ -1133,29 +1153,135 @@ export async function createCompletion(model: string, messages: any[], convId?: 
     });
 }
 
-export async function performSearch(query: string, req?: any) {
-    const creds = await getCredentials(req);
-    const { cookie, xiaomichatbot_ph } = creds;
-    const encodedPh = encodeURIComponent(xiaomichatbot_ph);
-    // 🌟 平台升级 (2026-10)：react/chat 端点
-    const url = `https://aistudio.xiaomimimo.com/open-apis/react/chat?xiaomichatbot_ph=${encodedPh}`;
-    
-    logger.info(`[Search Request] Query: ${query} | Model: ${process.env.MCP_SEARCH_MODEL || "mimo-v2.5-pro"}`);
+export interface SearchResultItem {
+    title: string;
+    url: string;
+    snippet: string;
+    siteName?: string;
+    datePublished?: string;
+}
 
-    const payload: any = {
+export interface SearchOptions {
+    model?: string;
+    maxResults?: number;
+    includeDomains?: string[];
+    excludeDomains?: string[];
+}
+
+export interface SearchResponse {
+    base_resp?: { status_code: number; status_msg: string };
+    data?: { results: SearchResultItem[] };
+    results?: SearchResultItem[];
+    error?: unknown;
+    details?: string;
+}
+
+export interface VisionOptions {
+    model?: string;
+    enableThinking?: boolean;
+}
+
+export interface VisionResponse {
+    base_resp: { status_code: number; status_msg: string };
+    data: { content: string; details?: string };
+}
+
+function getErrorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+}
+
+interface RawSearchItem {
+    name?: unknown;
+    title?: unknown;
+    url?: unknown;
+    snippet?: unknown;
+    text?: unknown;
+    siteName?: unknown;
+    datePublished?: unknown;
+}
+
+function normalizeSearchResults(rawItems: RawSearchItem[], options: SearchOptions): SearchResultItem[] {
+    const byUrl = new Map<string, SearchResultItem>();
+    const includeDomains = (options.includeDomains ?? [])
+        .map((d) => d.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, ""))
+        .filter((d) => d.length > 0);
+    const excludeDomains = (options.excludeDomains ?? [])
+        .map((d) => d.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, ""))
+        .filter((d) => d.length > 0);
+
+    for (const item of rawItems) {
+        const url = String(item?.url ?? "").trim();
+        if (!url) continue;
+
+        let host = "";
+        try {
+            host = new URL(url).hostname.toLowerCase();
+        } catch {
+            host = "";
+        }
+        if (includeDomains.length > 0 && (!host || !includeDomains.some((d) => host === d || host.endsWith(`.${d}`)))) {
+            continue;
+        }
+        if (excludeDomains.length > 0 && host && excludeDomains.some((d) => host === d || host.endsWith(`.${d}`))) {
+            continue;
+        }
+
+        const title = String(item?.name ?? item?.title ?? "").trim();
+        const rawSnippet = String(item?.snippet ?? "").trim();
+        const rawText = String(item?.text ?? "").trim();
+        const bestSnippet = rawText.length > rawSnippet.length ? rawText.slice(0, 600) : rawSnippet;
+        const siteName = typeof item?.siteName === "string" ? item.siteName.trim() : "";
+        const datePublished = typeof item?.datePublished === "string" ? item.datePublished.trim() : "";
+
+        const existing = byUrl.get(url);
+        if (existing) {
+            if (bestSnippet && !existing.snippet.includes(bestSnippet.slice(0, 80))) {
+                const merged = existing.snippet ? `${existing.snippet}\n${bestSnippet}` : bestSnippet;
+                existing.snippet = merged.slice(0, 900);
+            }
+            if (!existing.title && title) existing.title = title;
+            if (!existing.siteName && siteName) existing.siteName = siteName;
+            if (!existing.datePublished && datePublished) existing.datePublished = datePublished;
+        } else {
+            byUrl.set(url, {
+                title,
+                url,
+                snippet: bestSnippet,
+                ...(siteName ? { siteName } : {}),
+                ...(datePublished ? { datePublished } : {}),
+            });
+        }
+    }
+
+    const deduped = Array.from(byUrl.values());
+    if (options.maxResults && options.maxResults > 0) {
+        return deduped.slice(0, options.maxResults);
+    }
+    return deduped;
+}
+
+function executeSingleSearch(
+    url: string,
+    query: string,
+    searchPrompt: string,
+    searchModel: string,
+    cookie: string,
+    options: SearchOptions
+): Promise<{ response: SearchResponse; retryable: boolean }> {
+    const payload = {
         msgId: uuidv4().replace(/-/g, ''),
         conversationId: uuidv4().replace(/-/g, '').substring(0, 32),
-        query: query,
+        query: searchPrompt,
         isEditedQuery: false,
         modelConfig: {
-            enableThinking: true,
+            enableThinking: false,
             webSearchStatus: "enabled",
-            model: mapStationModel(process.env.MCP_SEARCH_MODEL || "mimo-v2.5-pro"), 
+            model: mapStationModel(searchModel),
         },
         multiMedias: []
     };
 
-    const headers: any = {
+    const headers = {
         "Content-Type": "application/json",
         "Accept": "*/*",
         "Cookie": cookie,
@@ -1166,291 +1292,368 @@ export async function performSearch(query: string, req?: any) {
     };
 
     const controller = new AbortController();
-    
-    return new Promise((resolve, reject) => {
-        let results: any[] = [];
-        let resolved = false;
+    const { promise, resolve } = Promise.withResolvers<{ response: SearchResponse; retryable: boolean }>();
+    let resolved = false;
+    let timeoutId: NodeJS.Timeout | undefined;
 
-        const parser = createParser((event) => {
-            if (event.type === "event") {
-                if (event.event === "web_search") {
-                    try {
-                        const data = JSON.parse(event.data);
-                        if (Array.isArray(data)) {
-                            results = data.map((item: any) => ({
-                                title: item.name || item.title,
-                                url: item.url,
-                                snippet: item.snippet || ""
-                            }));
-                            resolved = true;
-                            controller.abort(); 
-                            resolve({
-                                base_resp: { status_code: 0, status_msg: "success" },
-                                data: { results }
-                            });
-                        }
-                    } catch (e) {
-                        logger.error(`[Search Parse Error] ${e.message}`);
+    const finish = (response: SearchResponse, retryable: boolean, abortStream = false): void => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeoutId);
+        if (abortStream) controller.abort();
+        resolve({ response, retryable });
+    };
+
+    const parser = createParser((event) => {
+        if (event.type === "event") {
+            if (event.event === "web_search") {
+                try {
+                    const data: unknown = JSON.parse(event.data);
+                    if (Array.isArray(data)) {
+                        const results = normalizeSearchResults(data as RawSearchItem[], options);
+                        finish({
+                            base_resp: { status_code: 0, status_msg: "success" },
+                            data: { results }
+                        }, false, true);
                     }
-                } else if (event.event === "error" || event.event === "sensitive_query") {
-                    // 如果后端直接报错（文本超长/敏感拦截等）
-                    logger.error(`[Search API Error Payload] ${event.data}`);
-                    resolved = true;
-                    controller.abort();
-                    resolve({ results: [], error: event.data });
+                } catch (e: unknown) {
+                    logger.error(`[Search Parse Error] ${getErrorMessage(e)}`);
                 }
+            } else if (event.event === "error" || event.event === "sensitive_query") {
+                logger.error(`[Search API Error Payload] ${event.data}`);
+                finish({ results: [], error: event.data }, false, true);
+            }
+        }
+    });
+
+    axios.post(url, payload, {
+        headers,
+        responseType: "stream",
+        signal: controller.signal,
+        validateStatus: () => true
+    }).then(async response => {
+        if (response.status !== 200) {
+            let errBody = "";
+            try {
+                const chunks: Buffer[] = [];
+                for await (const chunk of response.data) {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                    if (Buffer.concat(chunks).length > 1000) break;
+                }
+                if (typeof response.data?.destroy === 'function') response.data.destroy();
+                errBody = Buffer.concat(chunks).toString("utf8");
+            } catch (e) {}
+
+            const errorMsg = response.status === 401
+                ? "Mimo API Error: 401 (Unauthorized: MiMo cookie/token expired or invalid)"
+                : `Mimo API Error: ${response.status}`;
+            logger.error(`[Search API Error] HTTP ${response.status} | Body: ${errBody}`);
+            const retryable = response.status >= 500 || response.status === 429;
+            finish({ results: [], error: errorMsg, details: errBody }, retryable);
+            return;
+        }
+
+        response.data.on("data", (chunk: Buffer) => {
+            parser.feed(chunk.toString("utf8"));
+        });
+
+        response.data.on("end", () => {
+            if (!resolved) {
+                logger.warn(`[Search End] No search results found for: ${query}`);
+                finish({
+                    base_resp: { status_code: 0, status_msg: "success" },
+                    data: { results: [] }
+                }, true);
             }
         });
 
-        axios.post(url, payload, { 
-            headers, 
-            responseType: "stream", 
-            signal: controller.signal,
-            validateStatus: () => true 
-        }).then(async response => {
-            if (response.status !== 200) {
-                let errBody = "";
-                try {
-                    // 尝试读取一小段错误体
-                    const chunks: any[] = [];
-                    for await (const chunk of response.data) {
-                        chunks.push(chunk);
-                        if (Buffer.concat(chunks).length > 1000) break;
-                    }
-                    errBody = Buffer.concat(chunks).toString("utf8");
-                } catch (e) {}
-                
-                logger.error(`[Search API Error] HTTP ${response.status} | Body: ${errBody}`);
-                resolve({ results: [], error: `Mimo API Error: ${response.status}`, details: errBody });
-                return;
-            }
-
-            response.data.on("data", (chunk: Buffer) => {
-                parser.feed(chunk.toString("utf8"));
-            });
-
-            response.data.on("end", () => {
-                if (!resolved) {
-                    logger.warn(`[Search End] No search results found for: ${query}`);
-                    resolve({
-                        base_resp: { status_code: 0, status_msg: "success" },
-                        data: { results: [] }
-                    });
-                }
-            });
-
-            response.data.on("error", (err: any) => {
-                if (err.name === 'AbortError' || axios.isCancel(err)) {
-                    // Normal termination
-                } else {
-                    logger.error(`[Search Stream Error] ${err.message}`);
-                    if (!resolved) resolve({ results: [], error: err.message });
-                }
-            });
-        }).catch(err => {
-            if (err.name === 'AbortError' || axios.isCancel(err)) {
+        response.data.on("error", (err: unknown) => {
+            if (axios.isCancel(err) || (err instanceof Error && err.name === 'AbortError')) {
                 // Normal termination
             } else {
-                logger.error(`[Search POST Error] ${err.message}`);
-                resolve({ results: [], error: err.message });
+                const msg = getErrorMessage(err);
+                logger.error(`[Search Stream Error] ${msg}`);
+                finish({ results: [], error: msg }, true);
             }
         });
-
-        // 20秒超时保护
-        setTimeout(() => {
-            if (!resolved) {
-                controller.abort();
-                logger.warn(`[Search Timeout] No results for: ${query}`);
-                resolve({
-                    base_resp: { status_code: 1, status_msg: "Search timeout" },
-                    data: { results: [] }
-                });
-            }
-        }, 20000);
+    }).catch((err: unknown) => {
+        if (axios.isCancel(err) || (err instanceof Error && err.name === 'AbortError')) {
+            // Normal termination
+        } else {
+            const msg = getErrorMessage(err);
+            logger.error(`[Search POST Error] ${msg}`);
+            finish({ results: [], error: msg }, true);
+        }
     });
+
+    // 60秒超时保护
+    timeoutId = setTimeout(() => {
+        if (!resolved) {
+            logger.warn(`[Search Timeout] No results for: ${query}`);
+            finish({
+                base_resp: { status_code: 1, status_msg: "Search timeout" },
+                data: { results: [] }
+            }, false, true);
+        }
+    }, 60000);
+
+    return promise;
 }
-/**
- * 🌟 全模态识别接口 (Agent Tool 模式)
- * 支持图像、视频、音频、PDF
- */
-export async function performVision(query: string, medias: any[], req?: any) {
+
+export async function performSearch(query: string, req?: unknown, options: SearchOptions = {}): Promise<SearchResponse> {
     const creds = await getCredentials(req);
     const { cookie, xiaomichatbot_ph } = creds;
     const encodedPh = encodeURIComponent(xiaomichatbot_ph);
-    // 🌟 平台升级 (2026-10)：react/chat 端点
     const url = `https://aistudio.xiaomimimo.com/open-apis/react/chat?xiaomichatbot_ph=${encodedPh}`;
-    
-    logger.info(`[Vision Request] Query: ${query} | Medias: ${medias.length} | Model: ${req?.body?.model || process.env.MCP_VISION_MODEL || "mimo-v2.5"}`);
 
-    // 1. 处理媒体上传
-    const multiMedias: any[] = [];
-    let isAnyNewMedia = false; 
+    const searchModel = options.model || process.env.MCP_SEARCH_MODEL || "mimo-v2.6-flash";
+    const searchPrompt = /\p{Script=Han}/u.test(query)
+        ? `请联网检索以下内容的最新权威信息：${query}`
+        : `Please search the web for: ${query}`;
+
+    logger.info(`[Search Request] Query: ${query} | Model: ${searchModel}`);
+
+    const first = await executeSingleSearch(url, query, searchPrompt, searchModel, cookie, options);
+    if (!first.retryable) return first.response;
+
+    logger.info(`[Search Retry] Retrying search once for: ${query}`);
+    const second = await executeSingleSearch(url, query, searchPrompt, searchModel, cookie, options);
+    return second.response;
+}
+
+const EXTENSION_MIME_MAP: Record<string, string> = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".pdf": "application/pdf",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+};
+
+/**
+ * 🌟 全模态识别接口 (Agent Tool 模式)
+ * 支持图像、视频、音频、PDF 与多图对比
+ */
+export async function performVision(query: string, medias: unknown[], req?: unknown, options: VisionOptions = {}): Promise<VisionResponse> {
+    const creds = await getCredentials(req);
+    const { cookie, xiaomichatbot_ph } = creds;
+    const encodedPh = encodeURIComponent(xiaomichatbot_ph);
+    const url = `https://aistudio.xiaomimimo.com/open-apis/react/chat?xiaomichatbot_ph=${encodedPh}`;
+
+    let reqBodyModel: string | undefined;
+    if (req && typeof req === "object" && "body" in req && req.body && typeof req.body === "object" && "model" in req.body && typeof req.body.model === "string") {
+        reqBodyModel = req.body.model;
+    }
+    interface PreparedMediaItem {
+        buffer: Buffer;
+        mimeType: string;
+        md5: string;
+    }
+    const preparedMedias: PreparedMediaItem[] = [];
 
     for (const item of medias) {
-        // Support both object {image: "..."} and string "..."
-        const mediaSource = typeof item === 'string' ? item : item.image;
+        const mediaSource = typeof item === 'string'
+            ? item
+            : (item && typeof item === 'object' && 'image' in item && typeof item.image === 'string' ? item.image : "");
         if (!mediaSource) continue;
 
-        let base64 = "";
+        let buffer: Buffer;
         let mimeType = "image/jpeg";
-        
-        if (typeof mediaSource === 'string') {
-            if (mediaSource.startsWith('data:')) {
-                base64 = mediaSource.split(",")[1];
-                mimeType = mediaSource.split(";")[0].split(":")[1];
-            } else if (mediaSource.startsWith('http')) {
-                try {
-                    const res = await axios.get(mediaSource, { responseType: 'arraybuffer' });
-                    base64 = Buffer.from(res.data, 'binary').toString('base64');
-                    mimeType = res.headers['content-type'] || 'image/jpeg';
-                } catch (e) {
-                    logger.error(`[Vision Download Error] ${mediaSource}: ${e.message}`);
-                    continue;
-                }
-            } else {
-                // ✨ Fixed Directory Logic: Use MEDIA_BASE_DIR for local files
-                const fileName = path.basename(mediaSource);
-                const targetPath = path.join(MEDIA_BASE_DIR, fileName);
-                
-                if (fs.pathExistsSync(targetPath) && fs.lstatSync(targetPath).isFile()) {
-                    try {
-                        const buffer = await fs.readFile(targetPath);
-                        base64 = buffer.toString('base64');
-                        
-                        // 🌟 Dynamic MIME Detection
-                        const ext = path.extname(fileName).toLowerCase();
-                        if (['.mp4', '.mov', '.webm'].includes(ext)) mimeType = "video/mp4";
-                        else if (['.png'].includes(ext)) mimeType = "image/png";
-                        else if (['.gif'].includes(ext)) mimeType = "image/gif";
-                        else if (['.mp3', '.wav', '.m4a'].includes(ext)) mimeType = "audio/mpeg";
-                        else mimeType = "image/jpeg";
 
-                        logger.info(`[Vision Storage] Read: ${fileName} | Type: ${mimeType} | Size: ${buffer.length}`);
-                    } catch (e) {
-                        logger.error(`[Vision Local File Error] ${targetPath}: ${e.message}`);
-                        continue;
+        if (mediaSource.startsWith('data:')) {
+            const commaIdx = mediaSource.indexOf(",");
+            const headerPart = commaIdx >= 0 ? mediaSource.slice(5, commaIdx) : "";
+            const base64Part = commaIdx >= 0 ? mediaSource.slice(commaIdx + 1) : mediaSource;
+            buffer = Buffer.from(base64Part, "base64");
+            const headerMime = headerPart.split(";")[0].trim();
+            const detected = await fileTypeFromBuffer(buffer);
+            mimeType = detected?.mime || headerMime || "image/jpeg";
+        } else if (mediaSource.startsWith('http://') || mediaSource.startsWith('https://')) {
+            try {
+                const res = await axios.get(mediaSource, {
+                    responseType: 'arraybuffer',
+                    timeout: 20000,
+                    maxContentLength: 50 * 1024 * 1024,
+                    headers: {
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
                     }
-                } else {
-                    const errMsg = `Media file not found in storage: ${fileName}. Please ensure the file is placed in the mounted media directory.`;
-                    logger.error(`[Vision Path Error] ${errMsg}`);
-                    throw new Error(errMsg);
-                }
-            }
-        }
-
-        if (base64) {
-            const buffer = Buffer.from(base64, "base64");
-            const md5 = crypto.createHash("md5").update(buffer).digest("hex");
-            if (!mediaCache.has(md5)) isAnyNewMedia = true;
-            
-            const dataUrl = `data:${mimeType};base64,${base64}`;
-            const mediaObj = await uploadMediaToMimo(dataUrl, cookie, xiaomichatbot_ph, req?.body?.model || process.env.MCP_VISION_MODEL || "mimo-v2.5");
-            
-            if (mediaObj) {
-                let mediaType = "image";
-                if (mimeType.startsWith("video/")) mediaType = "video";
-                else if (mimeType.startsWith("audio/")) mediaType = "audio";
-                else if (mimeType.includes("pdf")) mediaType = "file";
-
-                multiMedias.push({
-                    mediaType: mediaType,
-                    fileUrl: mediaObj.fileUrl,
-                    compressedVideoUrl: mediaType === "video" ? mediaObj.fileUrl : "",
-                    audioTrackUrl: mediaType === "audio" ? mediaObj.fileUrl : "",
-                    name: mediaObj.name || `vision_media_${md5.substring(0, 6)}`,
-                    size: mediaObj.size || buffer.length,
-                    status: "completed",
-                    objectName: mediaObj.objectName,
-                    tokenUsage: mediaObj.tokenUsage, 
-                    url: mediaObj.url 
                 });
+                buffer = Buffer.from(res.data);
+                const detected = await fileTypeFromBuffer(buffer);
+                const headerMime = typeof res.headers['content-type'] === 'string' ? res.headers['content-type'].split(";")[0].trim() : "";
+                mimeType = detected?.mime || (headerMime && headerMime !== "application/octet-stream" ? headerMime : "image/jpeg");
+            } catch (e: unknown) {
+                const errMsg = `Failed to download media URL (${mediaSource}): ${getErrorMessage(e)}`;
+                logger.error(`[Vision Download Error] ${errMsg}`);
+                throw new Error(errMsg);
             }
+        } else {
+            const fileName = path.basename(mediaSource);
+            const targetPath = path.join(MEDIA_BASE_DIR, fileName);
+
+            if (!fs.pathExistsSync(targetPath) || !fs.lstatSync(targetPath).isFile()) {
+                const errMsg = `Media file not found in storage: ${fileName}. Please ensure the file is placed in the mounted media directory.`;
+                logger.error(`[Vision Path Error] ${errMsg}`);
+                throw new Error(errMsg);
+            }
+
+            buffer = await fs.readFile(targetPath);
+            const detected = await fileTypeFromBuffer(buffer);
+            const ext = path.extname(fileName).toLowerCase();
+            mimeType = detected?.mime || EXTENSION_MIME_MAP[ext] || "image/jpeg";
+            logger.info(`[Vision Storage] Read: ${fileName} | Type: ${mimeType} | Size: ${buffer.length}`);
+        }
+
+        if (buffer.length > 0) {
+            const md5 = crypto.createHash("md5").update(buffer).digest("hex");
+            preparedMedias.push({ buffer, mimeType, md5 });
         }
     }
 
-    if (isAnyNewMedia) {
-        logger.info(`[Vision] New media, waiting 3s...`);
-        await new Promise(resolve => setTimeout(resolve, 3000));
+    const explicitModel = options.model || reqBodyModel || process.env.MCP_VISION_MODEL;
+    const allImages = preparedMedias.length > 0 && preparedMedias.every((m) => m.mimeType.startsWith("image/"));
+    const visionModel = explicitModel || (allImages ? "mimo-v2.6-pro" : "mimo-v2.6-flash");
+    const enableThinking = options.enableThinking ?? visionModel.toLowerCase().includes("pro");
+
+    logger.info(`[Vision Request] Query: ${query} | Medias: ${preparedMedias.length} | Model: ${visionModel} (${explicitModel ? "explicit" : (allImages ? "auto:image->pro" : "auto:media->flash")})`);
+
+    interface UploadedMediaItem {
+        mediaType: string;
+        fileUrl: string;
+        compressedVideoUrl: string;
+        audioTrackUrl: string;
+        name: string;
+        size: number;
+        objectName: string;
+        tokenUsage: number;
+        url: string;
+    }
+    const multiMedias: UploadedMediaItem[] = [];
+
+    for (const media of preparedMedias) {
+        const dataUrl = `data:${media.mimeType};base64,${media.buffer.toString("base64")}`;
+        const mediaObj = await uploadMediaToMimo(dataUrl, cookie, xiaomichatbot_ph, visionModel) as Partial<UploadedMediaItem> | null;
+
+        if (mediaObj && mediaObj.url && mediaObj.fileUrl && mediaObj.objectName) {
+            multiMedias.push({
+                mediaType: mediaObj.mediaType || "image",
+                fileUrl: mediaObj.fileUrl,
+                compressedVideoUrl: mediaObj.compressedVideoUrl || "",
+                audioTrackUrl: mediaObj.audioTrackUrl || "",
+                name: mediaObj.name || `vision_media_${media.md5.substring(0, 6)}`,
+                size: mediaObj.size || media.buffer.length,
+                objectName: mediaObj.objectName,
+                tokenUsage: mediaObj.tokenUsage || 106,
+                url: mediaObj.url
+            });
+        }
     }
 
-    const payload: any = {
-        msgId: uuidv4().replace(/-/g, ''),
-        conversationId: uuidv4().replace(/-/g, '').substring(0, 32),
-        query: query,
-        isEditedQuery: false,
-        // 🌟 react 协议精简 payload
-        modelConfig: {
-            enableThinking: true,
-            webSearchStatus: "disabled",
-            model: mapStationModel(req?.body?.model || process.env.MCP_VISION_MODEL || "mimo-v2.5"),
-        },
-        multiMedias: multiMedias.map((m: any) => ({
-            mediaType: m.mediaType,
-            fileUrl: m.fileUrl,
-            compressedVideoUrl: "",
-            audioTrackUrl: "",
-            name: m.name,
-            size: m.size,
-            status: "completed",
-            objectName: m.objectName,
-            tokenUsage: m.tokenUsage, 
-            url: m.url 
-        }))
-    };
-
-    const headers: any = { 
-        "Content-Type": "application/json", 
+    const headers = {
+        "Content-Type": "application/json",
         "Accept": "*/*",
-        "Cookie": cookie, 
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", 
-        "Referer": "https://aistudio.xiaomimimo.com/", 
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+        "Referer": "https://aistudio.xiaomimimo.com/",
         "Origin": "https://aistudio.xiaomimimo.com",
         "x-timezone": "Asia/Shanghai"
     };
 
-    return new Promise((resolve, reject) => {
+    const mappedMedias = multiMedias.map((m) => ({
+        mediaType: m.mediaType,
+        fileUrl: m.fileUrl,
+        compressedVideoUrl: m.compressedVideoUrl,
+        audioTrackUrl: m.audioTrackUrl,
+        name: m.name,
+        size: m.size,
+        status: "completed",
+        objectName: m.objectName,
+        tokenUsage: m.tokenUsage,
+        url: m.url
+    }));
+    const mappedModel = mapStationModel(visionModel);
+
+    const runAttempt = (): Promise<{ response: VisionResponse; retryable: boolean }> => {
+        const payload = {
+            msgId: uuidv4().replace(/-/g, ''),
+            conversationId: uuidv4().replace(/-/g, '').substring(0, 32),
+            query: query,
+            isEditedQuery: false,
+            modelConfig: {
+                enableThinking,
+                webSearchStatus: "disabled",
+                model: mappedModel,
+            },
+            multiMedias: mappedMedias
+        };
+
+        const controller = new AbortController();
+        const { promise, resolve } = Promise.withResolvers<{ response: VisionResponse; retryable: boolean }>();
         let fullContent = "";
+        let fullReasoning = "";
         let resolved = false;
+        let timeoutId: NodeJS.Timeout | undefined;
+
+        const finish = (response: VisionResponse, retryable: boolean, abortStream = false): void => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timeoutId);
+            if (abortStream) controller.abort();
+            resolve({ response, retryable });
+        };
 
         const parser = createParser((event) => {
             if (event.type === "event") {
                 if (event.event === "message") {
                     try {
-                        const data = JSON.parse(event.data);
-                        // V2.6 模型流中会夹杂 NUL 分隔符，统一剔除
+                        const data = JSON.parse(event.data) as { content?: unknown; reasoningContent?: unknown };
                         if (data.content) fullContent += String(data.content).replace(/\u0000/g, "");
+                        if (data.reasoningContent) fullReasoning += String(data.reasoningContent).replace(/\u0000/g, "");
                     } catch (e) {}
                 } else if (event.event === "error" || event.event === "sensitive_query") {
                     logger.error(`[Vision API Error Payload] ${event.data}`);
-                    resolved = true;
-                    resolve({
+                    finish({
                         base_resp: { status_code: 2, status_msg: event.data },
                         data: { content: fullContent }
-                    });
+                    }, false, true);
                 }
             }
         });
 
-        axios.post(url, payload, { 
-            headers, 
+        axios.post(url, payload, {
+            headers,
             responseType: "stream",
-            validateStatus: () => true 
+            signal: controller.signal,
+            validateStatus: () => true
         }).then(async response => {
             if (response.status !== 200) {
                 let errBody = "";
                 try {
-                    const chunks: any[] = [];
+                    const chunks: Buffer[] = [];
                     for await (const chunk of response.data) {
-                        chunks.push(chunk);
+                        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
                         if (Buffer.concat(chunks).length > 1000) break;
                     }
+                    if (typeof response.data?.destroy === 'function') response.data.destroy();
                     errBody = Buffer.concat(chunks).toString("utf8");
                 } catch (e) {}
+                const statusMsg = response.status === 401
+                    ? "HTTP 401 (Unauthorized: MiMo cookie/token expired or invalid)"
+                    : `HTTP ${response.status}`;
                 logger.error(`[Vision API Error] HTTP ${response.status} | Body: ${errBody}`);
-                resolve({
-                    base_resp: { status_code: 3, status_msg: `HTTP ${response.status}` },
+                finish({
+                    base_resp: { status_code: 3, status_msg: statusMsg },
                     data: { content: fullContent, details: errBody }
-                });
+                }, response.status >= 500 || response.status === 429);
                 return;
             }
 
@@ -1460,30 +1663,63 @@ export async function performVision(query: string, medias: any[], req?: any) {
 
             response.data.on("end", () => {
                 if (!resolved) {
-                    // 🌟 核心清理：剥离隐藏的思维链标签
-                    const cleanContent = fullContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-                    resolve({
+                    const rawOutput = fullContent.trim() || fullReasoning.trim();
+                    const cleanContent = rawOutput.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+                    finish({
                         base_resp: { status_code: 0, status_msg: "success" },
                         data: { content: cleanContent }
-                    });
+                    }, false);
                 }
             });
 
-            response.data.on("error", (err: any) => {
-                logger.error(`[Vision Stream Error] ${err.message}`);
-                if (!resolved) resolve({
-                    base_resp: { status_code: 4, status_msg: err.message },
+            response.data.on("error", (err: unknown) => {
+                if (axios.isCancel(err) || (err instanceof Error && err.name === 'AbortError')) {
+                    // Normal termination
+                } else {
+                    const msg = getErrorMessage(err);
+                    logger.error(`[Vision Stream Error] ${msg}`);
+                    const retryable = fullContent.trim().length === 0 && fullReasoning.trim().length === 0;
+                    finish({
+                        base_resp: { status_code: 4, status_msg: msg },
+                        data: { content: fullContent.trim() }
+                    }, retryable);
+                }
+            });
+        }).catch((err: unknown) => {
+            if (axios.isCancel(err) || (err instanceof Error && err.name === 'AbortError')) {
+                // Normal termination
+            } else {
+                const msg = getErrorMessage(err);
+                logger.error(`[Vision POST Error] ${msg}`);
+                const retryable = fullContent.trim().length === 0 && fullReasoning.trim().length === 0;
+                finish({
+                    base_resp: { status_code: 5, status_msg: msg },
                     data: { content: fullContent.trim() }
-                });
-            });
-        }).catch(err => {
-            logger.error(`[Vision POST Error] ${err.message}`);
-            resolve({
-                base_resp: { status_code: 5, status_msg: err.message },
-                data: { content: fullContent.trim() }
-            });
+                }, retryable);
+            }
         });
-    });
+
+        // 90秒超时保护（覆盖大视频及长文档推理）
+        timeoutId = setTimeout(() => {
+            if (!resolved) {
+                logger.warn(`[Vision Timeout] Timed out for query: ${query}`);
+                finish({
+                    base_resp: { status_code: 6, status_msg: "Vision timeout" },
+                    data: { content: fullContent.trim() }
+                }, false, true);
+            }
+        }, 90000);
+
+        return promise;
+    };
+
+    const first = await runAttempt();
+    if (!first.retryable) return first.response;
+
+    logger.info(`[Vision Retry] Retrying react/chat after transient stream error (${first.response.base_resp.status_msg})...`);
+    await sleep(2500);
+    const second = await runAttempt();
+    return second.response;
 }
 
 export default {
