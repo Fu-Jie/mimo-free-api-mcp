@@ -9,6 +9,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "crypto";
 import * as mimo from "./mimo.ts";
+import type { SearchResponse, SearchResultItem, VisionResponse } from "./mimo.ts";
 import logger from "@/lib/logger.ts";
 import Request from "@/lib/request/Request.ts";
 
@@ -43,7 +44,7 @@ export class MCPServerManager {
      */
     private static createServerWithRef(sessionRef: { id: string }, fallbackRequest: Request): Server {
         const server = new Server(
-            { name: "mimo-free-api-mcp", version: "1.2.0" },
+            { name: "mimo-free-api-mcp", version: "1.5.0" },
             { capabilities: { tools: {} } }
         );
 
@@ -52,25 +53,31 @@ export class MCPServerManager {
             tools: [
                 {
                     name: "search",
-                    description: "Perform a web search using Mimo AI to get the latest information. Returns a summary of findings with citations.",
+                    description: "Perform a web search using Mimo AI (V2.6) to get the latest information. Prefer concise 'entity + attribute + context' phrases for richest recall. Returns deduplicated results with source name, publish date, URL, and snippet.",
                     inputSchema: {
                         type: "object",
                         properties: {
                             query: { type: "string", description: "The search query or question to answer" },
+                            model: { type: "string", description: "Optional model override (defaults to mimo-v2.6-flash; can pass mimo-v2.6-pro)" },
+                            max_results: { type: "number", description: "Optional maximum number of deduplicated results to return" },
+                            include_domains: { type: "array", items: { type: "string" }, description: "Optional allowlist of domain suffixes (e.g. ['github.com', 'nvidia.com'])" },
+                            exclude_domains: { type: "array", items: { type: "string" }, description: "Optional blocklist of domain suffixes" },
                         },
                         required: ["query"]
                     }
                 },
                 {
                     name: "vision",
-                    description: "Multi-modal analysis for images, videos, and audio. Supports URLs, Base64 data URIs, or simple Filenames (which are automatically retrieved from the fixed /app/media storage).",
+                    description: "Multi-modal analysis using Mimo AI (V2.6) for images, videos, audio, and PDFs. Supports single `image` or multi-image `images` comparison via URLs, Base64 data URIs, or filenames from /app/media storage.",
                     inputSchema: {
                         type: "object",
                         properties: {
                             query: { type: "string", description: "The question or instruction about the media content" },
-                            image: { type: "string", description: "Media source: Can be a URL, Base64 URI, or just a Filename (e.g., 'video.mp4') from the local storage." },
+                            image: { type: "string", description: "Single media source: URL, Base64 data URI, or filename in /app/media (e.g. 'demo.mp4')" },
+                            images: { type: "array", items: { type: "string" }, description: "Multiple media sources for comparison or multi-page analysis" },
+                            model: { type: "string", description: "Optional model override (defaults to mimo-v2.6-pro for images, mimo-v2.6-flash for video/audio/PDF)" },
                         },
-                        required: ["query", "image"]
+                        required: ["query"]
                     }
                 }
             ]
@@ -85,25 +92,73 @@ export class MCPServerManager {
 
             try {
                 if (name === "search") {
-                    const { query } = args as { query: string };
-                    const result = await mimo.performSearch(query, request) as any;
+                    const { query, model, max_results, include_domains, exclude_domains } = (args ?? {}) as {
+                        query: string;
+                        model?: string;
+                        max_results?: number;
+                        include_domains?: string[];
+                        exclude_domains?: string[];
+                    };
+                    const result: SearchResponse = await mimo.performSearch(query, request, {
+                        model,
+                        maxResults: max_results,
+                        includeDomains: include_domains,
+                        excludeDomains: exclude_domains,
+                    });
 
-                    let text = "No search results found.";
-                    if (result && result.data && result.data.results) {
-                        text = result.data.results
-                            .map((r: any) => `### ${r.title}\nURL: ${r.url}\n${r.snippet}`)
-                            .join("\n\n");
+                    if (result.error) {
+                        const errText = typeof result.error === "string" ? result.error : JSON.stringify(result.error);
+                        const detail = result.details ? ` | ${result.details.slice(0, 300)}` : "";
+                        return {
+                            content: [{ type: "text", text: `Error: ${errText}${detail}` }],
+                            isError: true
+                        };
                     }
+                    if (result.base_resp && result.base_resp.status_code !== 0) {
+                        return {
+                            content: [{ type: "text", text: `Error: ${result.base_resp.status_msg || "Search failed"}` }],
+                            isError: true
+                        };
+                    }
+
+                    const results = result.data?.results;
+                    const text = Array.isArray(results) && results.length > 0
+                        ? results.map((r: SearchResultItem) => {
+                            const metaParts: string[] = [];
+                            if (r.siteName) metaParts.push(`Source: ${r.siteName}`);
+                            if (r.datePublished) metaParts.push(`Published: ${r.datePublished}`);
+                            const metaLine = metaParts.length > 0 ? `\n${metaParts.join(" | ")}` : "";
+                            return `### ${r.title}\nURL: ${r.url}${metaLine}\n${r.snippet}`;
+                        }).join("\n\n")
+                        : "No search results found.";
                     return { content: [{ type: "text", text }] };
                 }
 
                 if (name === "vision") {
-                    const { query, image } = args as { query: string, image: string };
-                    const result = await mimo.performVision(query, [image], request) as any;
-                    const text = result?.data?.content || "No content recognized.";
+                    const { query, image, images, model } = (args ?? {}) as {
+                        query: string;
+                        image?: string;
+                        images?: string[];
+                        model?: string;
+                    };
+                    const mediaList = Array.isArray(images) && images.length > 0 ? images : (image ? [image] : []);
+                    if (mediaList.length === 0) {
+                        return {
+                            content: [{ type: "text", text: "Error: Either `image` or non-empty `images` is required." }],
+                            isError: true
+                        };
+                    }
+                    const result: VisionResponse = await mimo.performVision(query, mediaList, request, { model });
+                    if (result.base_resp.status_code !== 0) {
+                        const detail = result.data.details ? ` | ${result.data.details.slice(0, 300)}` : "";
+                        return {
+                            content: [{ type: "text", text: `Error: ${result.base_resp.status_msg || "Vision failed"}${detail}` }],
+                            isError: true
+                        };
+                    }
+                    const text = result.data.content || "No content recognized.";
                     return { content: [{ type: "text", text }] };
                 }
-
                 throw new Error(`Tool not found: ${name}`);
             } catch (err: any) {
                 logger.error(`[MCP] Tool execution error (${name}):`, err.message);
